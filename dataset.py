@@ -1,6 +1,6 @@
 from torchvision import get_image_backend
 
-from datasets.videodataset import VideoDataset
+from datasets.videodataset import VideoDataset, KdDataset
 from datasets.videodataset_multiclips import (VideoDatasetMultiClips,
                                               collate_fn)
 from datasets.activitynet import ActivityNet
@@ -18,7 +18,8 @@ def get_training_data(video_path,
                       file_type,
                       spatial_transform=None,
                       temporal_transform=None,
-                      target_transform=None):
+                      target_transform=None,
+                      model = None):
     assert dataset_name in [
         'kinetics', 'activitynet', 'ucf101', 'hmdb51', 'mit'
     ]
@@ -53,7 +54,7 @@ def get_training_data(video_path,
                                     target_transform=target_transform,
                                     video_loader=loader,
                                     video_path_formatter=video_path_formatter)
-    else:
+    elif model != None:
         training_data = VideoDataset(video_path,
                                      annotation_path,
                                      'training',
@@ -62,6 +63,15 @@ def get_training_data(video_path,
                                      target_transform=target_transform,
                                      video_loader=loader,
                                      video_path_formatter=video_path_formatter)
+    else:
+        training_data = KdDataset(video_path,
+                                annotation_path,
+                                'training',
+                                spatial_transform=spatial_transform,
+                                temporal_transform=temporal_transform,
+                                target_transform=target_transform,
+                                video_loader=loader,
+                                video_path_formatter=video_path_formatter)
 
     return training_data
 
@@ -73,7 +83,8 @@ def get_validation_data(video_path,
                         file_type,
                         spatial_transform=None,
                         temporal_transform=None,
-                        target_transform=None):
+                        target_transform=None,
+                        model=None):
     assert dataset_name in [
         'kinetics', 'activitynet', 'ucf101', 'hmdb51', 'mit'
     ]
@@ -108,6 +119,16 @@ def get_validation_data(video_path,
                                       target_transform=target_transform,
                                       video_loader=loader,
                                       video_path_formatter=video_path_formatter)
+    elif model != None: 
+        validation_data = VideoDatasetMultiClips(
+            video_path,
+            annotation_path,
+            'validation',
+            spatial_transform=spatial_transform,
+            temporal_transform=temporal_transform,
+            target_transform=target_transform,
+            video_loader=loader,
+            video_path_formatter=video_path_formatter)
     else:
         validation_data = VideoDatasetMultiClips(
             video_path,

@@ -6,6 +6,7 @@ import os
 import numpy as np
 import torch
 from torch.nn import CrossEntropyLoss
+import torch.nn.functional as F
 from torch.optim import SGD, lr_scheduler
 import torch.multiprocessing as mp
 import torch.distributed as dist
@@ -31,6 +32,13 @@ from training import train_epoch
 from validation import val_epoch
 import inference
 
+
+"""
+    To add KD to this code, three things are needed.
+    1. Custom dataloader: which takes in data, or a dataloader, and computes the features.
+    2. Custom model where we strip down the final layer.
+    3. Miscellaneous
+"""
 
 def json_serial(obj):
     if isinstance(obj, Path):
@@ -120,6 +128,57 @@ def get_normalize_method(mean, std, no_mean_norm, no_std_norm):
             return Normalize(mean, [1, 1, 1])
         else:
             return Normalize(mean, std)
+
+
+def get_KD_train_utils(opt, model_parameters, model):
+
+    train_data = get_training_data(opt.video_path, opt.annotation_path,
+                                   opt.dataset, opt.input_type, opt.file_type,
+                                   spatial_transform, temporal_transform, model = model)
+
+    train_sampler = None
+
+    train_loader = torch.utils.data.DataLoader(train_data,
+                                               batch_size=opt.batch_size,
+                                               shuffle=(train_sampler is None),
+                                               num_workers=opt.n_threads,
+                                               pin_memory=True,
+                                               sampler=train_sampler,
+                                               worker_init_fn=worker_init_fn)
+
+    if opt.is_master_node:
+        train_logger = Logger(opt.result_path / 'train.log',
+                              ['epoch', 'loss', 'acc', 'lr'])
+        train_batch_logger = Logger(
+            opt.result_path / 'train_batch.log',
+            ['epoch', 'batch', 'iter', 'loss', 'acc', 'lr'])
+    else:
+        train_logger = None
+        train_batch_logger = None
+
+    if opt.nesterov:
+        dampening = 0
+    else:
+        dampening = opt.dampening
+
+    optimizer = SGD(model_parameters,
+                    lr=opt.learning_rate,
+                    momentum=opt.momentum,
+                    dampening=dampening,
+                    weight_decay=opt.weight_decay,
+                    nesterov=opt.nesterov)
+
+    assert opt.lr_scheduler in ['plateau', 'multistep']
+    assert not (opt.lr_scheduler == 'plateau' and opt.no_val)
+    if opt.lr_scheduler == 'plateau':
+        scheduler = lr_scheduler.ReduceLROnPlateau(
+            optimizer, 'min', patience=opt.plateau_patience)
+    else:
+        scheduler = lr_scheduler.MultiStepLR(optimizer,
+                                             opt.multistep_milestones)
+
+    return (train_loader, train_sampler, train_logger, train_batch_logger,
+            optimizer, scheduler)
 
 
 def get_train_utils(opt, model_parameters):
@@ -313,6 +372,71 @@ def save_checkpoint(save_file_path, epoch, arch, model, optimizer, scheduler):
         'scheduler': scheduler.state_dict()
     }
     torch.save(save_states, save_file_path)
+
+
+def KD(opt):
+    random.seed(opt.manual_seed)
+    np.random.seed(opt.manual_seed)
+    torch.manual_seed(opt.manual_seed)
+
+    if opt.device.type == 'cuda':
+        opt.device = torch.device(f'cuda:{index}')
+
+    model = generate_model(opt)
+    parameters = model.parameters()
+
+    if not opt.no_train:
+        (train_loader, train_sampler, train_logger, train_batch_logger,
+         optimizer, scheduler) = get_train_utils(opt, parameters)
+        if opt.resume_path is not None:
+            opt.begin_epoch, optimizer, scheduler = resume_train_utils(
+                opt.resume_path, opt.begin_epoch, optimizer, scheduler)
+            if opt.overwrite_milestones:
+                scheduler.milestones = opt.multistep_milestones
+
+        if opt.tensorboard and opt.is_master_node:
+        from torch.utils.tensorboard import SummaryWriter
+        if opt.begin_epoch == 1:
+            tb_writer = SummaryWriter(log_dir=opt.result_path)
+        else:
+            tb_writer = SummaryWriter(log_dir=opt.result_path,
+                                      purge_step=opt.begin_epoch)
+    else:
+        tb_writer = None
+
+    prev_val_loss = None
+    for i in range(opt.begin_epoch, opt.n_epochs + 1):
+        if not opt.no_train:
+            if opt.distributed:
+                train_sampler.set_epoch(i)
+            current_lr = get_lr(optimizer)
+            train_epoch(i, train_loader, model, criterion, optimizer,
+                        opt.device, current_lr, train_logger,
+                        train_batch_logger, tb_writer, opt.distributed)
+
+            if i % opt.checkpoint == 0 and opt.is_master_node:
+                save_file_path = opt.result_path / 'save_{}.pth'.format(i)
+                save_checkpoint(save_file_path, i, opt.arch, model, optimizer,
+                                scheduler)
+
+        if not opt.no_val:
+            prev_val_loss = val_epoch(i, val_loader, model, criterion,
+                                      opt.device, val_logger, tb_writer,
+                                      opt.distributed)
+
+        if not opt.no_train and opt.lr_scheduler == 'multistep':
+            scheduler.step()
+        elif not opt.no_train and opt.lr_scheduler == 'plateau':
+            scheduler.step(prev_val_loss)
+
+    if opt.inference:
+        inference_loader, inference_class_names = get_inference_utils(opt)
+        inference_result_path = opt.result_path / '{}.json'.format(
+            opt.inference_subset)
+
+        inference.inference(inference_loader, model, inference_result_path,
+                            inference_class_names, opt.inference_no_average,
+                            opt.output_topk)
 
 
 def main_worker(index, opt):
