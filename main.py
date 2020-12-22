@@ -5,7 +5,7 @@ import os
 
 import numpy as np
 import torch
-from torch.nn import CrossEntropyLoss
+from torch.nn import CrossEntropyLoss, MSELoss
 import torch.nn.functional as F
 from torch.optim import SGD, lr_scheduler
 import torch.multiprocessing as mp
@@ -15,7 +15,7 @@ import torchvision
 
 from opts import parse_opts
 from model import (generate_model, load_pretrained_model, make_data_parallel,
-                   get_fine_tuning_parameters)
+                   get_fine_tuning_parameters, generate_teacher_model)
 from mean import get_mean_std
 from spatial_transforms import (Compose, Normalize, Resize, CenterCrop,
                                 CornerCrop, MultiScaleCornerCrop,
@@ -131,6 +131,45 @@ def get_normalize_method(mean, std, no_mean_norm, no_std_norm):
 
 
 def get_KD_train_utils(opt, model_parameters, model):
+
+    assert opt.train_crop in ['random', 'corner', 'center']
+    spatial_transform = []
+    if opt.train_crop == 'random':
+        spatial_transform.append(
+            RandomResizedCrop(
+                opt.sample_size, (opt.train_crop_min_scale, 1.0),
+                (opt.train_crop_min_ratio, 1.0 / opt.train_crop_min_ratio)))
+    elif opt.train_crop == 'corner':
+        scales = [1.0]
+        scale_step = 1 / (2**(1 / 4))
+        for _ in range(1, 5):
+            scales.append(scales[-1] * scale_step)
+        spatial_transform.append(MultiScaleCornerCrop(opt.sample_size, scales))
+    elif opt.train_crop == 'center':
+        spatial_transform.append(Resize(opt.sample_size))
+        spatial_transform.append(CenterCrop(opt.sample_size))
+    normalize = get_normalize_method(opt.mean, opt.std, opt.no_mean_norm,
+                                     opt.no_std_norm)
+    if not opt.no_hflip:
+        spatial_transform.append(RandomHorizontalFlip())
+    if opt.colorjitter:
+        spatial_transform.append(ColorJitter())
+    spatial_transform.append(ToTensor())
+    if opt.input_type == 'flow':
+        spatial_transform.append(PickFirstChannels(n=2))
+    spatial_transform.append(ScaleValue(opt.value_scale))
+    spatial_transform.append(normalize)
+    spatial_transform = Compose(spatial_transform)
+
+    assert opt.train_t_crop in ['random', 'center']
+    temporal_transform = []
+    if opt.sample_t_stride > 1:
+        temporal_transform.append(TemporalSubsampling(opt.sample_t_stride))
+    if opt.train_t_crop == 'random':
+        temporal_transform.append(TemporalRandomCrop(opt.sample_duration))
+    elif opt.train_t_crop == 'center':
+        temporal_transform.append(TemporalCenterCrop(opt.sample_duration))
+    temporal_transform = TemporalCompose(temporal_transform)
 
     train_data = get_training_data(opt.video_path, opt.annotation_path,
                                    opt.dataset, opt.input_type, opt.file_type,
@@ -270,6 +309,54 @@ def get_train_utils(opt, model_parameters):
     return (train_loader, train_sampler, train_logger, train_batch_logger,
             optimizer, scheduler)
 
+def get_KD_val_utils(opt):
+    normalize = get_normalize_method(opt.mean, opt.std, opt.no_mean_norm,
+                                     opt.no_std_norm)
+    spatial_transform = [
+        Resize(opt.sample_size),
+        CenterCrop(opt.sample_size),
+        ToTensor()
+    ]
+    if opt.input_type == 'flow':
+        spatial_transform.append(PickFirstChannels(n=2))
+    spatial_transform.extend([ScaleValue(opt.value_scale), normalize])
+    spatial_transform = Compose(spatial_transform)
+
+    temporal_transform = []
+    if opt.sample_t_stride > 1:
+        temporal_transform.append(TemporalSubsampling(opt.sample_t_stride))
+    temporal_transform.append(
+        TemporalEvenCrop(opt.sample_duration, opt.n_val_samples))
+    temporal_transform = TemporalCompose(temporal_transform)
+
+    val_data, collate_fn = get_validation_data(opt.video_path,
+                                               opt.annotation_path, opt.dataset,
+                                               opt.input_type, opt.file_type,
+                                               spatial_transform,
+                                               temporal_transform)
+    if opt.distributed:
+        val_sampler = torch.utils.data.distributed.DistributedSampler(
+            val_data, shuffle=False)
+    else:
+        val_sampler = None
+    val_loader = torch.utils.data.DataLoader(val_data,
+                                             batch_size=(opt.batch_size //
+                                                         opt.n_val_samples),
+                                             shuffle=False,
+                                             num_workers=opt.n_threads,
+                                             pin_memory=True,
+                                             sampler=val_sampler,
+                                             worker_init_fn=worker_init_fn,
+                                             collate_fn=collate_fn)
+
+    if opt.is_master_node:
+        val_logger = Logger(opt.result_path / 'val.log',
+                            ['epoch', 'loss', 'acc'])
+    else:
+        val_logger = None
+
+    return val_loader, val_logger
+
 
 def get_val_utils(opt):
     normalize = get_normalize_method(opt.mean, opt.std, opt.no_mean_norm,
@@ -375,26 +462,40 @@ def save_checkpoint(save_file_path, epoch, arch, model, optimizer, scheduler):
 
 
 def KD(opt):
+
+    # Initialize random seeds.
     random.seed(opt.manual_seed)
     np.random.seed(opt.manual_seed)
     torch.manual_seed(opt.manual_seed)
 
+    # sets opt.device to cuda:0, modify this to allow for multiple workers on different cuda devices.
     if opt.device.type == 'cuda':
-        opt.device = torch.device(f'cuda:{index}')
+        opt.device = torch.device(f'cuda:0')
 
+    # Generates new model
     model = generate_model(opt)
     parameters = model.parameters()
 
+    teacher_model = generate_teacher_model(opt)
+
+    # Training code.
     if not opt.no_train:
+
+        assert opt.teacher_path != None
+        model = torch.load(opt.teacher_path)
+
         (train_loader, train_sampler, train_logger, train_batch_logger,
-         optimizer, scheduler) = get_train_utils(opt, parameters)
+         optimizer, scheduler) = get_KD_train_utils(opt, parameters, teacher_model)
+
         if opt.resume_path is not None:
             opt.begin_epoch, optimizer, scheduler = resume_train_utils(
                 opt.resume_path, opt.begin_epoch, optimizer, scheduler)
             if opt.overwrite_milestones:
                 scheduler.milestones = opt.multistep_milestones
+    if not opt.no_val:
+        val_loader, val_logger = get_val_utils(opt)
 
-        if opt.tensorboard and opt.is_master_node:
+    if opt.tensorboard and opt.is_master_node:
         from torch.utils.tensorboard import SummaryWriter
         if opt.begin_epoch == 1:
             tb_writer = SummaryWriter(log_dir=opt.result_path)
@@ -404,6 +505,9 @@ def KD(opt):
     else:
         tb_writer = None
 
+    criterion = CrossEntropyLoss().to(opt.device)
+    criterion2 = MSELoss().to(opt.device)
+
     prev_val_loss = None
     for i in range(opt.begin_epoch, opt.n_epochs + 1):
         if not opt.no_train:
@@ -412,7 +516,7 @@ def KD(opt):
             current_lr = get_lr(optimizer)
             train_epoch(i, train_loader, model, criterion, optimizer,
                         opt.device, current_lr, train_logger,
-                        train_batch_logger, tb_writer, opt.distributed)
+                        train_batch_logger, tb_writer, opt.distributed, criterion2=criterion2, lambda_criteria=1)
 
             if i % opt.checkpoint == 0 and opt.is_master_node:
                 save_file_path = opt.result_path / 'save_{}.pth'.format(i)
@@ -545,8 +649,11 @@ if __name__ == '__main__':
         torchvision.set_image_backend('accimage')
 
     opt.ngpus_per_node = torch.cuda.device_count()
-    if opt.distributed:
-        opt.world_size = opt.ngpus_per_node * opt.world_size
-        mp.spawn(main_worker, nprocs=opt.ngpus_per_node, args=(opt,))
+
+    if opt.type == "KD":
+        KD(opt)
+    # elif opt.distributed:
+    #     opt.world_size = opt.ngpus_per_node * opt.world_size
+    #     mp.spawn(main_worker, nprocs=opt.ngpus_per_node, args=(opt,))
     else:
         main_worker(-1, opt)

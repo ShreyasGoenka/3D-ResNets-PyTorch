@@ -54,7 +54,7 @@ def get_training_data(video_path,
                                     target_transform=target_transform,
                                     video_loader=loader,
                                     video_path_formatter=video_path_formatter)
-    elif model != None:
+    elif model == None:
         training_data = VideoDataset(video_path,
                                      annotation_path,
                                      'training',

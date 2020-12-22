@@ -20,7 +20,9 @@ def train_epoch(epoch,
                 epoch_logger,
                 batch_logger,
                 tb_writer=None,
-                distributed=False):
+                distributed=False,
+                criterion2 = None,
+                lambda_criteria = None):
     print('train at epoch {}'.format(epoch))
 
     model.train()
@@ -32,11 +34,24 @@ def train_epoch(epoch,
 
     end_time = time.time()
     for i, (inputs, targets) in enumerate(data_loader):
+        print("iter")
+        print(device)
         data_time.update(time.time() - end_time)
+        
+        if criterion2 != None:
+            soft_targets = targets[1]
+            targets = targets[0]
+            soft_targets = soft_targets.to(device, non_blocking = True)
 
         targets = targets.to(device, non_blocking=True)
+        
         outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        if criterion2 == None:
+            loss = criterion(outputs, targets)
+            print(outputs.shape)
+            print(targets.shape)
+        else:
+            loss = criterion(outputs, targets) + lambda_criteria*criterion2(outputs, soft_targets)
         acc = calculate_accuracy(outputs, targets)
 
         losses.update(loss.item(), inputs.size(0))
@@ -107,77 +122,3 @@ def train_epoch(epoch,
         tb_writer.add_scalar('train/lr', accuracies.avg, epoch)
 
 
-
-def train_KD_epoch(epoch,
-                data_loader,
-                model,
-                optimizer,
-                device,
-                current_lr,
-                epoch_logger,
-                batch_logger,
-                lambda_KD,
-                tb_writer=None,
-                distributed=False):
-    print('train at epoch {}'.format(epoch))
-
-    model.train()
-
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-    accuracies = AverageMeter()
-
-    end_time = time.time()
-    for i, (inputs, logits, targets) in enumerate(data_loader):
-        data_time.update(time.time() - end_time)
-
-        targets = targets.to(device, non_blocking=True)
-        logits = logits.to(device, non_blocking=True)
-        outputs = model(inputs)
-        loss = F.cross_entropy(outputs, targets) + lambda_KD*F.mse_loss(outputs, logits)
-        acc = calculate_accuracy(outputs, targets)
-
-        losses.update(loss.item(), inputs.size(0))
-        accuracies.update(acc, inputs.size(0))
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        batch_time.update(time.time() - end_time)
-        end_time = time.time()
-
-        if batch_logger is not None:
-            batch_logger.log({
-                'epoch': epoch,
-                'batch': i + 1,
-                'iter': (epoch - 1) * len(data_loader) + (i + 1),
-                'loss': losses.val,
-                'acc': accuracies.val,
-                'lr': current_lr
-            })
-
-        print('Epoch: [{0}][{1}/{2}]\t'
-              'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-              'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-              'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-              'Acc {acc.val:.3f} ({acc.avg:.3f})'.format(epoch,
-                                                         i + 1,
-                                                         len(data_loader),
-                                                         batch_time=batch_time,
-                                                         data_time=data_time,
-                                                         loss=losses,
-                                                         acc=accuracies))
-    if epoch_logger is not None:
-        epoch_logger.log({
-            'epoch': epoch,
-            'loss': losses.avg,
-            'acc': accuracies.avg,
-            'lr': current_lr
-        })
-
-    if tb_writer is not None:
-        tb_writer.add_scalar('train/loss', losses.avg, epoch)
-        tb_writer.add_scalar('train/acc', accuracies.avg, epoch)
-        tb_writer.add_scalar('train/lr', accuracies.avg, epoch)

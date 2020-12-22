@@ -4,6 +4,10 @@ from pathlib import Path
 
 def parse_opts():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--type',
+                        default=None,
+                        type=str,
+                        help='Knowledge Distillation, or pure training')
     parser.add_argument('--root_path',
                         default=None,
                         type=Path,
@@ -16,10 +20,27 @@ def parse_opts():
                         default=None,
                         type=Path,
                         help='Annotation file path')
+    parser.add_argument('--teacher_model_depth',
+                    default=18,
+                    type=int,
+                    help='Teacher model depth')
     parser.add_argument('--result_path',
                         default=None,
                         type=Path,
                         help='Result directory path')
+    parser.add_argument('--teacher_path',
+                        default=None,
+                        type=Path,
+                        help='Teacher model path for knowledge distillation')
+
+    parser.add_argument('--teacher_model',
+                        default='resnet',
+                        type=str,
+                        help=
+                        '(resnet | resnet2p1d | preresnet | wideresnet | resnext | densenet | ')
+    parser.add_argument('--fake_model',
+                        action='store_true',
+                        help='dev purposes, just to test the code.')
     parser.add_argument(
         '--dataset',
         default='kinetics',
